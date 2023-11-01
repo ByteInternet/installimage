@@ -39,11 +39,15 @@ echo 3 >/proc/sys/vm/drop_caches
 # realconfig
 SCRIPTPATH="$(dirname "$0")"
 REALCONFIG="$SCRIPTPATH/config.sh"
+INSTALLIMAGE_CONFIG_OVERRIDE="${INSTALLIMAGE_CONFIG_OVERRIDE:-/root/installimage-config-override.sh}"
 
 FOLD="$(mktemp -d /installimage.XXXXX)"
 
 # copy our config file and read global variables and functions
 cp -a "$REALCONFIG" /tmp/install.vars
+if [[ -n "${INSTALLIMAGE_CONFIG_OVERRIDE}" ]]; then
+  cat "${INSTALLIMAGE_CONFIG_OVERRIDE}" >> /tmp/install.vars
+fi
 . /tmp/install.vars
 
 # clear debugfile
