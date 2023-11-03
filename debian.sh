@@ -10,6 +10,8 @@
 # generate_config_mdadm "NIL"
 generate_config_mdadm() {
   local mdadmconf="/etc/mdadm/mdadm.conf"
+  execute_chroot_command "apt update"
+  execute_chroot_command "apt install -y mdadm"
   execute_chroot_command "/usr/share/mdadm/mkconf > $mdadmconf"; declare -i EXITCODE=$?
 
   #
