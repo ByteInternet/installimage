@@ -3184,6 +3184,14 @@ generate_new_sshkeys() {
       debug "skipping ed25519 key gen"
     fi
 
+    # Generate all remaining missing keys.
+    # This option has been available since OpenSSH v5.9:
+    #   https://www.openssh.com/txt/release-5.9
+    execute_chroot_command "ssh-keygen -A"; EXITCODE=$?
+    if [ "$EXITCODE" -ne "0" ]; then
+      return $EXITCODE
+    fi
+
     ### create json of host ssh fingerprints for robot
     local keys_json=""
 
