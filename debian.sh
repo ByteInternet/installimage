@@ -70,6 +70,9 @@ generate_new_ramdisk() {
 generate_config_grub() {
   declare -i EXITCODE=0
 
+  # Make sure grub-cloud-amd64 is not installed.
+  execute_chroot_command "apt remove -y grub-cloud-amd64"
+
   local grubdefconf="$FOLD/hdd/etc/default/grub"
 
   # set linux_default in grub
