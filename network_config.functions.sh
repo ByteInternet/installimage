@@ -825,7 +825,25 @@ setup_network_config() {
       setup_etc_sysconfig_network_scripts_centos
     ;;
     suse) setup_etc_sysconfig_network_scripts_suse;;
-    debian) setup_etc_network_interfaces;;
+    debian)
+      if ((IMG_VERSION >= 1200)); then
+        execute_chroot_command_wo_debug 'rm -f /etc/netplan/*'
+        setup_etc_netplan_01_netcfg_yaml || return 1
+        local stderr_file="$FOLD/netplan_generate.stderr"
+        if ! execute_chroot_command_wo_debug 'netplan generate' 2> "$stderr_file"; then
+          debug 'fatal: netplan generate failed:'
+          cat "$stderr_file" | debugoutput
+          return 1
+        fi
+        if [[ -s "$stderr_file" ]]; then
+          debug 'fatal: netplan generate stderr not empty:'
+          cat "$stderr_file" | debugoutput
+          return 1
+        fi
+      else
+        setup_etc_network_interfaces
+      fi
+    ;;
     ubuntu)
      if ((IMG_VERSION >= 1710)); then
        setup_etc_netplan_01_netcfg_yaml || return 1
