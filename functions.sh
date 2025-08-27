@@ -2948,26 +2948,39 @@ extract_image() {
 # $DNSRESOLVER in a random order.
 #
 generate_resolvconf() {
-  if [ "$IAM" = "suse" ] && [ "$IMG_VERSION" -ge 122 ]; then
-    # disable netconfig of DNS servers in YaST config file
+  if [ "$IAM" = "suse" ]; then
+
+    # use YaST config for the DNS resolvers
     sed -i -e \
-      "s/^NETCONFIG_DNS_POLICY=\".*\"/NETCONFIG_DNS_POLICY=\"\"/" \
-      "$FOLD/hdd/etc/sysconfig/network/config"
-  fi
+      "s/^NETCONFIG_DNS_POLICY=\".*\"/NETCONFIG_DNS_POLICY=\"auto\"/" \
+      "${FOLD}/hdd/etc/sysconfig/network/config"
+      # generate List of DNS Servers
+      # (netconfig only uses the first 3 configured servers, but we just set all in one row)
+    while read nsaddr; do
+      DNSRESOLVERLIST+=("$nsaddr")
+    done < <(randomized_nsaddrs)
+    # configure the DNS servers statically in /etc/sysconfig/network/config
+    sed -i -e \
+      "s/^NETCONFIG_DNS_STATIC_SERVERS=\".*\"/NETCONFIG_DNS_STATIC_SERVERS=\"${DNSRESOLVERLIST[*]}\"/" \
+      "${FOLD}/hdd/etc/sysconfig/network/config"
 
-  if [[ -L "$FOLD/hdd/etc/resolv.conf" ]]; then
-    DNSRESOLVERFILE="$FOLD/hdd/etc/resolvconf/resolv.conf.d/base"
   else
-    DNSRESOLVERFILE="$FOLD/hdd/etc/resolv.conf"
+
+    if [[ -L "${FOLD}/hdd/etc/resolv.conf" ]]; then
+      DNSRESOLVERFILE="${FOLD}/hdd/etc/resolvconf/resolv.conf.d/base"
+    else
+      DNSRESOLVERFILE="${FOLD}/hdd/etc/resolv.conf"
+    fi
+
+    echo -e "### ${COMPANY} installimage" > "$DNSRESOLVERFILE"
+    echo -e '# nameserver config' >> "$DNSRESOLVERFILE"
+    while read nsaddr; do
+      echo "nameserver ${nsaddr}" >> "$DNSRESOLVERFILE"
+    done < <(randomized_nsaddrs)
+
+    diff -Naur /dev/null "${FOLD}/hdd/etc/resolv.conf" | debugoutput
+
   fi
-
-  echo -e "### $COMPANY installimage" > $DNSRESOLVERFILE
-  echo -e "# nameserver config" >> $DNSRESOLVERFILE
-  while read nsaddr; do
-    echo "nameserver $nsaddr" >> "$DNSRESOLVERFILE"
-  done < <(randomized_nsaddrs)
-
-  diff -Naur /dev/null "$FOLD/hdd/etc/resolv.conf" | debugoutput
 
   return 0
 }
