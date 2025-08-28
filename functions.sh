@@ -108,6 +108,8 @@ generate_menu() {
     RAWLIST="$IMAGESPATH/archlinux-latest-64-minimal.tar.gz"
   elif [[ "$1" == 'CentOS Stream' ]]; then
     RAWLIST=$(find "$IMAGESPATH"/ -maxdepth 1 -type f -iname '*centos*stream*' -not -regex '.*\.sig$' -printf '%f\n')
+  elif [[ "$1" == 'openSUSE' ]]; then
+    RAWLIST=$(find "$IMAGESPATH"/ -maxdepth 1 -type f -iname '*opensuse*' -not -regex '.*\.sig$' -printf '%f\n')
   elif [[ "$1" == 'AlmaLinux' ]]; then
     RAWLIST=$(find "$IMAGESPATH"/ -maxdepth 1 -type f -iname '*alma*' -not -regex '.*\.sig$' -printf '%f\n')
   elif [[ "$1" == 'Rocky Linux' ]]; then
@@ -152,6 +154,20 @@ generate_menu() {
       RAWLIST="$(sort -k 1,1 -k 2,2hr -t '-' <<< "$RAWLIST")"
     ;;
   esac
+
+  # remove still beta images unless menu is Other
+  if [[ "$1" != 'Other' ]]; then
+    local image beta_image new_rawlist=()
+    while read image; do
+      for beta_image in "${IMAGE_STILL_BETA_OVERRIDES[@]}"; do
+        if [[ "$image" == "$beta_image" ]]; then
+          continue 2
+        fi
+      done
+      new_rawlist+=("$image")
+    done <<< "$RAWLIST"
+    RAWLIST="$(printf '%s\n' "${new_rawlist[@]}")"
+  fi
 
   # generate formatted list for usage with "dialog"
   for i in $RAWLIST; do
@@ -550,7 +566,7 @@ create_config() {
     local LIMIT=2096128
     local THREE_TB=2861588
     local DRIVE_SIZE; DRIVE_SIZE="$(sfdisk -s "$(smallest_hd)" 2>/dev/null)"
-    DRIVE_SIZE="$(echo "$DRIVE_SIZE" / 1024 | bc)"
+    DRIVE_SIZE="$(echo "$DRIVE_SIZE" / 1024 | bc)" # MiB
 
     # adjust swap dynamically according to RAM
     # RAM < 2 GB : SWAP=2 * RAM
@@ -567,6 +583,12 @@ create_config() {
       SWAPSIZE=$((RAM / 1024 + 1))
     elif [ "$RAM" -lt 65535 ]; then
       SWAPSIZE=$((RAM / 2 / 1024 + 1))
+    fi
+
+    # revert swap size to 4G if swap wouldnt fit into smallest disk
+    DRIVE_SIZE_GIB=$((DRIVE_SIZE / 1024))
+    if (( SWAPSIZE >= DRIVE_SIZE_GIB )); then
+      SWAPSIZE=4
     fi
 
     ESPPART='PART /boot/efi esp 256M\n'
@@ -806,7 +828,9 @@ if [ -n "$1" ]; then
     if [ "${PART_MOUNT[$i]}" = "/" ]; then
       HASROOT="true"
     fi
-    test -n "${PART_CRYPT[$i]}"; CRYPT=$((1 - $?))
+    if [[ -n "${PART_CRYPT[$i]}" ]]; then
+      CRYPT=1
+    fi
   done < /tmp/part_lines.tmp
 
   # get encryption password
@@ -1012,16 +1036,6 @@ validate_vars() {
   fi
 
   whoami "$IMAGE_FILE"
-
-  # validate image supported
-  if [[ "$IAM" == centos ]] && (((IMG_VERSION >= 60 && IMG_VERSION < 70)) || ((IMG_VERSION == 610))); then
-    graph_error "ERROR: CentOS 6 is EOL since Nov 2020 and installimage does not support CentOS 6 anymore"
-    return 1
-  fi
-  if (( UEFI == 1 )) && rhel_9_based_image; then
-    graph_error "ERROR: we do not yet support $IAM $IMG_VERSION on EFI systems"
-    return 1
-  fi
 
   if [[ "$IMG_ARCH" == 'unknown' ]]; then
     graph_error "ERROR: can not determine image arch from filename"
@@ -2200,8 +2214,11 @@ make_fstab_entry() {
   if grep -q '^/dev/disk/by-' <<< "$1"; then
     p='-part'
   else
-    p="$(echo $1 | grep nvme)"
-    [ -n "$p" ] && p='p'
+    local p; p=""
+    local nvme; nvme="$(echo $1 | grep nvme)"
+    [ -n "$nvme" ] && p='p'
+    local disk_by; disk_by="$(echo $1 | grep '^/dev/disk/by-')"
+    [ -n "$disk_by" ] && p='-part'
   fi
 
   if [ "$4" = "swap" ] ; then
@@ -2306,7 +2323,6 @@ make_swraid() {
         metadata_boot="--metadata=0.90"
       fi
     fi
-    [ "$IAM" == "suse" -a "$IMG_VERSION" -lt 123 ] && metadata="--metadata=0.90"
 
     while read line ; do
       PARTNUM="$(next_partnum $count)"
@@ -2323,10 +2339,10 @@ make_swraid() {
         continue
       elif [ -n "$(echo "$line" | grep "/boot")" -a  "$metadata_boot" == "--metadata=0.90" ] || [ "$metadata" == "--metadata=0.90" ]; then
         # update fstab - replace /dev/sdaX with /dev/mdY
-        echo $line | sed "s/$SEDHDD\(p\)\?[0-9]\+/\/dev\/md$md_count/g" >> $fstab
+        echo $line | sed "s/$SEDHDD\(p\|-part\)\?[0-9]\+/\/dev\/md$md_count/g" >> $fstab
       else
         # update fstab - replace /dev/sdaX with /dev/md/Y
-        echo $line | sed "s/$SEDHDD\(p\)\?[0-9]\+/\/dev\/md\/$md_count/g" >> $fstab
+        echo $line | sed "s/$SEDHDD\(p\|-part\)\?[0-9]\+/\/dev\/md\/$md_count/g" >> $fstab
       fi
 
       # create raid array
@@ -2337,8 +2353,12 @@ make_swraid() {
         local n=0
         for n in $(seq 1 $COUNT_DRIVES) ; do
           TARGETDISK="$(eval echo \$DRIVE${n})"
-          local p="$(echo $TARGETDISK | grep nvme)"
-          [ -n "$p" ] && p='p'
+          local p; p=""
+          local nvme; nvme="$(echo $TARGETDISK | grep nvme)"
+          [ -n "$nvme" ] && p='p'
+          local disk_by; disk_by="$(echo $TARGETDISK | grep '^/dev/disk/by-')"
+          [ -n "$disk_by" ] && p='-part'
+
           components="$components $TARGETDISK$p$PARTNUM"
         done
 
@@ -2390,8 +2410,11 @@ make_lvm() {
   if [ -n "$1" ] ; then
     local fstab=$1
     local disk=$DRIVE1
-    local p; p="$(echo "$disk" | grep nvme)"
-    [ -n "$p" ] && p='p'
+    local p; p=""
+    local nvme; nvme="$(echo $TARGETDISK | grep nvme)"
+    [ -n "$nvme" ] && p='p'
+    local disk_by; disk_by="$(echo $TARGETDISK | grep '^/dev/disk/by-')"
+    [ -n "$disk_by" ] && p='-part'
 
     # TODO: needs to be removed
     # get device names for PVs depending if we use swraid or not
@@ -2421,7 +2444,7 @@ make_lvm() {
     # remove all Physical Volumes
     debug "# Removing all Physical Volumes"
     while read -r pv vg; do
-      if [[ "$vg" =~ $PRESERVE_VG ]]; then
+      if [[ -n "$PRESERVE_VG" ]] && [[ "$vg" =~ $PRESERVE_VG ]]; then
         debug "Not removing VG $vg"
       else
         pvremove -ff "$pv" 2>&1 | debugoutput
@@ -2645,6 +2668,8 @@ create_btrfs_subvolumes() {
             entries="$entries$entry"
           fi
         done
+        #Set default subvolume
+        btrfs subvolume set-default 256 "$tmp_mount"
         umount "$tmp_mount"
       fi
     done < "$fstab"
@@ -2948,26 +2973,39 @@ extract_image() {
 # $DNSRESOLVER in a random order.
 #
 generate_resolvconf() {
-  if [ "$IAM" = "suse" ] && [ "$IMG_VERSION" -ge 122 ]; then
-    # disable netconfig of DNS servers in YaST config file
+  if [ "$IAM" = "suse" ]; then
+
+    # use YaST config for the DNS resolvers
     sed -i -e \
-      "s/^NETCONFIG_DNS_POLICY=\".*\"/NETCONFIG_DNS_POLICY=\"\"/" \
-      "$FOLD/hdd/etc/sysconfig/network/config"
-  fi
+      "s/^NETCONFIG_DNS_POLICY=\".*\"/NETCONFIG_DNS_POLICY=\"auto\"/" \
+      "${FOLD}/hdd/etc/sysconfig/network/config"
+      # generate List of DNS Servers
+      # (netconfig only uses the first 3 configured servers, but we just set all in one row)
+    while read nsaddr; do
+      DNSRESOLVERLIST+=("$nsaddr")
+    done < <(randomized_nsaddrs)
+    # configure the DNS servers statically in /etc/sysconfig/network/config
+    sed -i -e \
+      "s/^NETCONFIG_DNS_STATIC_SERVERS=\".*\"/NETCONFIG_DNS_STATIC_SERVERS=\"${DNSRESOLVERLIST[*]}\"/" \
+      "${FOLD}/hdd/etc/sysconfig/network/config"
 
-  if [[ -L "$FOLD/hdd/etc/resolv.conf" ]]; then
-    DNSRESOLVERFILE="$FOLD/hdd/etc/resolvconf/resolv.conf.d/base"
   else
-    DNSRESOLVERFILE="$FOLD/hdd/etc/resolv.conf"
+
+    if [[ -L "${FOLD}/hdd/etc/resolv.conf" ]]; then
+      DNSRESOLVERFILE="${FOLD}/hdd/etc/resolvconf/resolv.conf.d/base"
+    else
+      DNSRESOLVERFILE="${FOLD}/hdd/etc/resolv.conf"
+    fi
+
+    echo -e "### ${COMPANY} installimage" > "$DNSRESOLVERFILE"
+    echo -e '# nameserver config' >> "$DNSRESOLVERFILE"
+    while read nsaddr; do
+      echo "nameserver ${nsaddr}" >> "$DNSRESOLVERFILE"
+    done < <(randomized_nsaddrs)
+
+    diff -Naur /dev/null "${FOLD}/hdd/etc/resolv.conf" | debugoutput
+
   fi
-
-  echo -e "### $COMPANY installimage" > $DNSRESOLVERFILE
-  echo -e "# nameserver config" >> $DNSRESOLVERFILE
-  while read nsaddr; do
-    echo "nameserver $nsaddr" >> "$DNSRESOLVERFILE"
-  done < <(randomized_nsaddrs)
-
-  diff -Naur /dev/null "$FOLD/hdd/etc/resolv.conf" | debugoutput
 
   return 0
 }
@@ -3743,6 +3781,8 @@ install_robot_report_script() {
       local link_service=1
     elif [[ "$IAM" == 'almalinux' ]]; then
       local link_service=1
+    elif [[ "$IAM" == 'suse' ]]; then
+      local link_service=1
     elif debian_buster_image; then
       local link_service=1
     elif debian_bullseye_image; then
@@ -3926,6 +3966,26 @@ function getHDDsNotInToleranceRange() {
   return 0
 }
 
+# build_device_map
+#
+# This function generates the GRUB Device Map file, which maps GRUB's internal disk
+# numbering (e.g., hd0, hd1) to the actual physical drives in the system (e.g., /dev/sda, /dev/sdb).
+#
+build_device_map() {
+  local dmapfile="${FOLD}/hdd/boot/${1}/device.map"
+  rm -f "$dmapfile"
+  touch "$dmapfile"
+
+  for ((i = 1; i <= COUNT_DRIVES; i++)); do
+    local j=$((i - 1))
+    local disk=$(eval echo "\$DRIVE${i}")
+    echo "(hd${j}) ${disk}" >> "$dmapfile"
+  done
+
+  debug '# device map:'
+  debugoutput < "$dmapfile"
+}
+
 uuid_bugfix() {
     debug "# change all device names to uuid (e.g. for ide/pata transition)"
     TEMPFILE="$(mktemp)"
@@ -3951,6 +4011,34 @@ uuid_bugfix() {
     done < "$TEMPFILE"
     rm "$TEMPFILE"
     return 0
+}
+
+get_uuid_from_fstab() {
+  local mount_point="$1"
+  grep -E "[[:space:]]${mount_point}[[:space:]]" "${FOLD}/hdd/etc/fstab" | awk '{for(i=1;i<=NF;i++) if($i ~ /^UUID=/) {print $i; exit}}' | sed 's/UUID=//'
+}
+
+grub2_uuid_bugfix() {
+  uuid_bugfix
+
+  if [[ "$UEFI" -eq 1 ]]; then
+    local boot_uuid boot_prefix
+    debug "running grub2 efi specific tasks"
+
+    if grep -qE "[[:space:]]/boot[[:space:]]" "${FOLD}/hdd/etc/fstab"; then
+      # UUID for boot partition
+      boot_uuid=$(get_uuid_from_fstab /boot)
+      boot_prefix='grub2'
+    else
+      # UUID for root partition
+      boot_uuid=$(get_uuid_from_fstab /)
+      boot_prefix='boot/grub2'
+    fi
+
+    [ -e "${FOLD}/hdd/boot/efi/EFI/${1}/grub.cfg" ] && sed -i "s|set prefix=.*|set prefix=(\$dev)/${boot_prefix}|" "${FOLD}/hdd/boot/efi/EFI/${1}/grub.cfg"
+    [ -e "${FOLD}/hdd/boot/efi/EFI/${1}/grub.cfg" ] && sed -i -E "s|(search .* )(--set=.*)|\1--set=dev ${boot_uuid}|" "${FOLD}/hdd/boot/efi/EFI/${1}/grub.cfg"
+  fi
+  return 0
 }
 
 disk_serial() {
@@ -3989,8 +4077,13 @@ function hdinfo() {
     *)
       local smartctl_json model_name serial_number
       if ! smartctl_json="$(smartctl -i -j "$dev" 2> /dev/null)"; then
-        echo '# unknown'
-        return
+        if is_usb_disk "$dev"; then
+          echo '# USB disk'
+          return
+        else
+          echo '# unknown'
+          return
+        fi
       fi
       model_name="$(jq -r '.model_name // empty' <<< "$smartctl_json" 2> /dev/null)" || :
       serial_number="$(disk_serial "$dev")" || :

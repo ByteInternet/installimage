@@ -32,7 +32,9 @@ rescue_gen_password_hash() {
     return 1
   fi
   cp /etc/shado{w,w.installimage_bak}
-  "$SCRIPTPATH/util/passwd$rescue_algo.sh" <<< "$password"$'\n'"$password" &> /dev/null || return 1
+  local passwd_cmd='passwd'
+  if [[ -e /usr/bin/passwd_real ]]; then passwd_cmd='passwd_real'; fi
+  PASSWD_CMD="$passwd_cmd" "$SCRIPTPATH/util/passwd$rescue_algo.sh" <<< "$password"$'\n'"$password" &> /dev/null || return 1
   local password_hash
   if ! password_hash="$(rescue_root_password_hash)"; then
     debug 'internal error: get rescue root password hash failed'
@@ -69,6 +71,8 @@ rescue_password_hashing_algo_supported_by_installed_os() {
   if [[ "$IAM" == ubuntu ]] && ((IMG_VERSION < 2004)); then
     verify_machinectl_login_works "$random_password" && return
   elif [[ "$IAM" == debian ]] && ((IMG_VERSION >= 900)) && ((IMG_VERSION < 1000)); then
+    verify_machinectl_login_works "$random_password" && return
+  elif [[ "$IAM" == archlinux ]]; then
     verify_machinectl_login_works "$random_password" && return
   else
     execute_chroot_command_wo_debug "su nobody -s '$su_path'" <<< "$random_password" &> /dev/null && return

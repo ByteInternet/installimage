@@ -1,52 +1,46 @@
 #!/bin/bash
-
 #
-# Rocky Linux specific functions
+# RockyLinux specific functions
 #
 # (c) 2021, Hetzner Online GmbH
 #
 
-
 # generate_config_mdadm "NIL"
 generate_config_mdadm() {
-  if [ -n "$1" ]; then
-    local mdadmconf="/etc/mdadm.conf"
-    {
-      echo "DEVICE partitions"
-      echo "MAILADDR root"
-    } > "$FOLD/hdd$mdadmconf"
-    execute_chroot_command "mdadm --examine --scan >> $mdadmconf"; declare -i EXITCODE=$?
-    return $EXITCODE
-  fi
+  [[ -z "$1" ]] && return 0
+
+  local mdadmconf='/etc/mdadm.conf'
+  {
+    echo 'DEVICE partitions'
+    echo 'MAILADDR root'
+  } > "${FOLD}/hdd${mdadmconf}"
+
+  execute_chroot_command "mdadm --examine --scan >> ${mdadmconf}"
+  return $?
 }
 
 # generate_new_ramdisk "NIL"
 generate_new_ramdisk() {
-  if [ -n "$1" ]; then
+  [[ -z "$1" ]] && return 0
 
-    # pick the latest kernel
-    VERSION="$(find "$FOLD/hdd/boot/" -name "vmlinuz-*" | cut -d '-' -f 2- | sort -V | tail -1)"
+  blacklist_unwanted_and_buggy_kernel_modules
+  configure_kernel_modules
 
-    blacklist_unwanted_and_buggy_kernel_modules
-    configure_kernel_modules
+  local dracutfile="${FOLD}/hdd/etc/dracut.conf.d/99-${C_SHORT}.conf"
+  cat << EOF > "$dracutfile"
+### ${COMPANY} - installimage
+add_dracutmodules+=" lvm mdraid "
+add_drivers+=" raid0 raid1 raid10 raid456 ext2 ext3 ext4 xfs vfat "
+hostonly="no"
+hostonly_cmdline="no"
+lvmconf="yes"
+mdadmconf="yes"
+persistent_policy="by-uuid"
+EOF
 
-    local dracutfile="$FOLD/hdd/etc/dracut.conf.d/99-$C_SHORT.conf"
-    {
-      echo "### $COMPANY - installimage"
-      echo 'add_dracutmodules+=" lvm mdraid "'
-      echo 'add_drivers+=" raid0 raid1 raid10 raid456 "'
-      #echo 'early_microcode="no"'
-      echo 'hostonly="no"'
-      echo 'hostonly_cmdline="no"'
-      echo 'lvmconf="yes"'
-      echo 'mdadmconf="yes"'
-      echo 'persistent_policy="by-uuid"'
-    } > "$dracutfile"
-
-    execute_chroot_command "dracut -f --kver $VERSION"
-    declare -i EXITCODE=$?
-    return "$EXITCODE"
-  fi
+  # generate initramfs for the latest kernel
+  execute_chroot_command "dracut -f --kver $(find "${FOLD}/hdd/boot/" -name 'vmlinuz-*' | cut -d '-' -f 2- | sort -V | tail -1)"
+  return $?
 }
 
 #
@@ -55,85 +49,134 @@ generate_new_ramdisk() {
 # Generate the GRUB bootloader configuration.
 #
 generate_config_grub() {
-  [ -n "$1" ] || return
-  # we should not have to do anything, as grubby (new-kernel-pkg) should have
-  # already generated a grub.conf
-  # even though grub2-mkconfig will generate a device.map on the fly, the
-  # anaconda installer still creates this
-  DMAPFILE="$FOLD/hdd/boot/grub2/device.map"
-  [ -f "$DMAPFILE" ] && rm "$DMAPFILE"
+  local grubdefconf="${FOLD}/hdd/etc/default/grub"
+  local grub_cmdline_linux='biosdevname=0 rd.auto=1 consoleblank=0'
 
-  local -i i=0
-  for ((i=1; i<=COUNT_DRIVES; i++)); do
-    local j; j="$((i - 1))"
-    local disk; disk="$(eval echo "\$DRIVE$i")"
-    echo "(hd$j) $disk" >> "$DMAPFILE"
-  done
-  debug '# device map:'
-  cat "$DMAPFILE" | debugoutput
+  debug "# Building device map for GRUB2"
+  build_device_map 'grub2'
 
-  local elevator=''
-  if is_virtual_machine; then
-    elevator='elevator=noop'
+  if rhel_9_based_image; then
+    grub_cmdline_linux+=' crashkernel=1G-4G:192M,4G-64G:256M,64G-:512M'
+  elif rhel_10_based_image; then
+    grub_cmdline_linux+=' crashkernel=2G-64G:256M,64G-:512M'
+  else
+    grub_cmdline_linux+=' crashkernel=auto'
   fi
 
-  local grub_cmdline_linux='biosdevname=0 crashkernel=auto'
-  is_virtual_machine && grub_cmdline_linux+=' elevator=noop'
-  (( USE_KERNEL_MODE_SETTING == 0 )) && grub_linux_default+=' nomodeset'
-  grub_cmdline_linux+=' rd.auto=1 consoleblank=0'
+  # nomodeset can help avoid issues with some GPUs.
+  if ((USE_KERNEL_MODE_SETTING == 0)); then
+    grub_cmdline_linux+=' nomodeset'
+  fi
 
+  # 'noop' scheduler is used in VMs to reduce overhead.
+  if is_virtual_machine; then
+    grub_cmdline_linux+=' elevator=noop'
+  fi
+
+  # disable memory-mapped PCI configuration
   if has_threadripper_cpu; then
     grub_cmdline_linux+=' pci=nommconf'
   fi
 
-  if [ "$SYSARCH" == "arm64" ]; then
+  if [[ "$SYSARCH" == "arm64" ]]; then
     grub_cmdline_linux+=' console=ttyAMA0 console=tty0'
   fi
 
-  sed -i "s/GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"$grub_cmdline_linux\"/" "$FOLD/hdd/etc/default/grub"
+  # Configure grub
+  debug "# Configuring grub defaults"
+  sed -i "s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"${grub_cmdline_linux}\"/" "$grubdefconf"
 
-  rm -f "$FOLD/hdd/boot/grub2/grub.cfg"
+    # Ensure all needed filesystem modules are loaded
+  sed -i '/^GRUB_PRELOAD_MODULES=/d' "$grubdefconf"
+  echo 'GRUB_PRELOAD_MODULES="part_gpt part_msdos lvm ext2 ext4 xfs"' >> "$grubdefconf"
+
+  # Ensure GRUB knows to use UUIDs
+  sed -i '/^GRUB_DISABLE_LINUX_UUID=/d' "$grubdefconf"
+  echo 'GRUB_DISABLE_LINUX_UUID=false' >> "$grubdefconf"
+
+  # Disable OS prober to prevent false positives
+  sed -i '/^GRUB_DISABLE_OS_PROBER=/d' "$grubdefconf"
+  echo 'GRUB_DISABLE_OS_PROBER=true' >> "$grubdefconf"
+
+  # Ensure GRUB timeout is reasonable
+  sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' "$grubdefconf"
+  sed -i 's/^GRUB_HIDDEN_TIMEOUT_QUIET=.*/GRUB_HIDDEN_TIMEOUT_QUIET=false/' "$grubdefconf"
+
+  # Make sure not using gfxmode
+  sed -i 's/^GRUB_TERMINAL=.*/GRUB_TERMINAL="console"/' "$grubdefconf"
+  sed -i 's/^GRUB_GFXMODE=.*/GRUB_GFXMODE="text"/' "$grubdefconf"
+
+  # set $GRUB_DEFAULT_OVERRIDE to specify custom GRUB_DEFAULT Value ( https://www.gnu.org/software/grub/manual/grub/grub.html#Simple-configuration )
+  [[ -n "$GRUB_DEFAULT_OVERRIDE" ]] && sed -i "s/^GRUB_DEFAULT=.*/GRUB_DEFAULT=${GRUB_DEFAULT_OVERRIDE}/" "$grubdefconf"
+
+  debug "# GRUB default configuration:"
+  cat "$grubdefconf" | debugoutput
+
+  # Install GRUB bootloader and generate configuration
+  debug "# Installing GRUB bootloader"
   if [ "$UEFI" -eq 1 ]; then
-    execute_chroot_command "grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg 2>&1"; declare -i EXITCODE="$?"
+    local grub2_install_flags="--efi-directory=/boot/efi --bootloader-id=rocky --no-nvram --force --recheck"
+
+    if [ "$SYSARCH" = "arm64" ]; then
+      # For ARM64 UEFI systems, use the correct target
+      grub2_install_flags="--target=arm64-efi ${grub2_install_flags} --removable"
+    else
+      # For x86_64 UEFI systems
+      grub2_install_flags="--target=x86_64-efi ${grub2_install_flags}"
+    fi
+
+    execute_chroot_command "grub2-install ${grub2_install_flags}"
+
+    # Set up fallback boot entries
+    execute_chroot_command "mkdir -p /boot/efi/EFI/BOOT" || return $?
+    if [ "$SYSARCH" = "arm64" ]; then
+      execute_chroot_command "cp /boot/efi/EFI/rocky/grubaa64.efi /boot/efi/EFI/BOOT/bootaa64.efi" || return $?
+    else
+      execute_chroot_command "cp /boot/efi/EFI/rocky/grubx64.efi /boot/efi/EFI/BOOT/bootx64.efi" || return $?
+    fi
   else
-    execute_chroot_command "grub2-mkconfig -o /boot/grub2/grub.cfg 2>&1"; declare -i EXITCODE="$?"
+    # For BIOS systems - install on ALL drives
+    for i in $(seq 1 $COUNT_DRIVES); do
+      local disk; disk="$(eval echo "\$DRIVE$i")"
+      debug "# Installing GRUB on $disk"
+      execute_chroot_command "grub2-install --target=i386-pc --force --recheck $disk" || return $?
+    done
   fi
-  uuid_bugfix
-  return "$EXITCODE"
 }
 
 write_grub() {
-  if [ "$UEFI" -eq 1 ]; then
-    # we must NOT use grub2-install here. This will replace the prebaked
-    # grubx64.efi (which looks for grub.cfg in ESP) with a new one, which
-    # looks for in in /boot/grub2 (which may be more difficult to read)
-    rm -f "$FOLD/hdd/boot/grub2/grubenv"
-    execute_chroot_command "ln -s /boot/efi/EFI/rocky/grubenv /boot/grub2/grubenv"
-    declare -i EXITCODE=$?
-  else
-    # only install grub2 in mbr of all other drives if we use swraid
-    for ((i=1; i<=COUNT_DRIVES; i++)); do
-      if [ "$SWRAID" -eq 1 ] || [ "$i" -eq 1 ] ;  then
-        local disk; disk="$(eval echo "\$DRIVE"$i)"
-        execute_chroot_command "grub2-install --no-floppy --recheck $disk 2>&1"
-        declare -i EXITCODE=$?
-      fi
-    done
+  # Generate the GRUB configuration file
+  debug "# Generating GRUB configuration"
+
+  local grub_mkconfig_flags=""
+  if rhel_9_based_image || rhel_10_based_image; then
+    # https://docs.rockylinux.org/en/latest/reference/grub2/grub2-mkconfig/
+    grub_mkconfig_flags="--update-bls-cmdline"
   fi
 
-  return "$EXITCODE"
+  execute_chroot_command "grub2-mkconfig -o /boot/grub2/grub.cfg ${grub_mkconfig_flags}" || return $?
+
+    # For UEFI, also build grub.cfg in the EFI directory + copy it to the fallback location
+  if [ "$UEFI" -eq 1 ]; then
+    if rhel_8_based_image; then
+      execute_chroot_command "grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg ${grub_mkconfig_flags}" || return $?
+    fi
+
+    # Apply UUID fixes to GRUB config
+    debug "# Applying UUID bugfixes to GRUB"
+    grub2_uuid_bugfix "rocky" || return $?
+
+    execute_chroot_command "cp /boot/efi/EFI/rocky/grub.cfg /boot/efi/EFI/BOOT/" || return $?
+  fi
 }
 
-#
 # os specific functions
-# for purpose of e.g. debian-sys-maint mysql user password in debian/ubuntu LAMP
-#
 run_os_specific_functions() {
   randomize_mdadm_array_check_time
 
   # selinux autorelabel if enabled
-  egrep -q "SELINUX=(enforcing|permissive)" "$FOLD/hdd/etc/sysconfig/selinux" &&
-    touch "$FOLD/hdd/.autorelabel"
+  grep -Eq 'SELINUX=(enforcing|permissive)' "${FOLD}/hdd/etc/sysconfig/selinux" &&
+    touch "${FOLD}/hdd/.autorelabel"
 
   return 0
 }
